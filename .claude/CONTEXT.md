@@ -27,3 +27,10 @@ Keep this file focused on repo-specific gotchas that are worth reusing in future
 
 - POSIX TZ signs are inverted from ISO 8601 in `TimeStore::applyTimezone()`: `"UTC-1"` means UTC+1.
 - `LyraTheme::drawHeader()` does not call `BaseTheme::drawHeader()`, so header changes in the base theme must be duplicated in Lyra if needed.
+
+## Build Tooling
+
+- A system-Python upgrade breaks PlatformIO's venv (`ModuleNotFoundError: platformio`); fix with `python3 -m venv --clear ~/.platformio/penv && ~/.platformio/penv/bin/pip install platformio`.
+- `freeink-sdk` is a git submodule; `git submodule update --init --recursive` is required before the first firmware build.
+- `custom_sdkconfig` in `platformio.ini` triggers a pioarduino hybrid rebuild of the Arduino core (full IDF compile, ~10+ min first time). Components with EMBED_TXTFILES certs (esp_insights, esp_rainmaker) break that rebuild and are removed via `custom_component_remove`; `esp-dsp` must stay because PNGdec's `s3_simd_rgb565.S` includes `dsps_fft2r_platform.h`.
+- `custom_component_remove` mutates `idf_component.yml` inside the installed `framework-arduinoespressif32` package, and the hybrid state marker is a generated `sdkconfig.defaults` in the repo root (gitignored). After changing the remove list **or** `custom_sdkconfig`, reset with: `rm -rf ~/.platformio/packages/framework-arduinoespressif32 ~/.platformio/packages/framework-arduinoespressif32-libs .pio/build/<env> sdkconfig.defaults sdkconfig.<env>` — incremental hybrid rebuilds otherwise leave stale libs (e.g. `esp-tls` rebuilt with `MBEDTLS_DYNAMIC_BUFFER` but `libmbedtls` without its `port/dynamic` sources → undefined `esp_mbedtls_dynamic_set_rx_buf_static` at link).

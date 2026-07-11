@@ -4,6 +4,13 @@
 
 ### Changed
 
+- OTA update checks and installs now run right after a quick automatic restart instead of inside the settings screen, because a secure connection needs more free memory than is available once the full UI is loaded. The update screen behaves as before; the device restarts silently in between.
+- The OTA firmware download now uses the GitHub API's direct asset endpoint, avoiding the github.com web frontend whose very large response headers crashed devices during updates.
+
+### Security
+
+- The OTA firmware download from the release CDN no longer verifies the server's TLS certificate chain; instead the downloaded image must match the SHA-256 recorded in the release manifest, which is still fetched over a fully verified TLS connection (the same signed-artifact model used by system package managers). This was required because the CDN's new certificate chain needs RSA-4096 operations whose memory peak exceeds what the ESP32-C3 can provide; a tampered download fails the checksum and is never installed.
+
 ### Fixed
 
 - Underlined EPUB text now draws a continuous line across the spaces between adjacent underlined words.
@@ -11,6 +18,7 @@
 - Chapter openers whose decorative image sits inside the heading (chapter number, ornament, then title) now stay together on one page instead of splitting the chapter number onto its own page.
 - Chapter openers with an inline ornament image no longer stack an oversized gap between the chapter number, the ornament, and the title.
 - Unsupported EPUB chapter image formats no longer trigger the low-memory image warning.
+- OTA update checks no longer crash or fail with "Update failed" on low-memory devices: the updater now fetches a ~1 KB release catalog from the CrossInk site instead of the ~32 KB GitHub API response (falling back to the GitHub API if the catalog is unavailable), TLS connections need roughly 20 KB less RAM at their peak (smaller send buffer, server certificates freed right after verification — this also helps OPDS and KOSync), the WiFi driver reserves fewer frame buffers so secure connections can always allocate their TLS buffers, failed manifest fetches are retried once, and the update check now allows 15 seconds instead of 5 for slow connections.
 
 ## [v1.4.0] - 2026-07-10
 
