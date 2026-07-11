@@ -7,6 +7,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() { return NO_UPDATE; }
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, std::atomic<bool>*) { return NO_UPDATE; }
 #else
 #include <Arduino.h>
+#include <CatalogJsonParser.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <ReleaseJsonParser.h>
@@ -26,14 +27,25 @@ namespace {
 #define CROSSINK_OTA_RELEASE_URL "https://api.github.com/repos/uxjulia/CrossInk/releases/latest"
 #endif
 
+// Primary update manifest: the release catalog on GitHub Pages. Its ~1KB
+// response with few small headers keeps esp_http_client's per-header heap
+// allocations tiny, unlike the ~32KB api.github.com release JSON whose
+// header/body parsing has crashed low-heap devices mid-TLS (#312).
+#ifndef CROSSINK_OTA_CATALOG_URL
+#define CROSSINK_OTA_CATALOG_URL "https://crossink.uxj.io/catalog"
+#endif
+
 constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
+constexpr char catalogUrl[] = CROSSINK_OTA_CATALOG_URL;
 
 #ifdef CROSSPOINT_FIRMWARE_VARIANT
 constexpr char firmwareAssetStem[] = "firmware-" CROSSPOINT_FIRMWARE_VARIANT;
 constexpr char firmwareAssetName[] = "firmware-" CROSSPOINT_FIRMWARE_VARIANT ".bin";
+constexpr const char* firmwareVariant = CROSSPOINT_FIRMWARE_VARIANT;
 #else
 constexpr char firmwareAssetStem[] = "firmware";
 constexpr char firmwareAssetName[] = "firmware.bin";
+constexpr const char* firmwareVariant = nullptr;
 #endif
 
 constexpr char binSuffix[] = ".bin";
@@ -269,20 +281,115 @@ struct OtaInstallContext {
   void* progressCtx = nullptr;
 };
 
-esp_err_t release_manifest_event_handler(esp_http_client_event_t* event) {
+void logTlsError(esp_http_client_handle_t client, const char* phase) {
+  int tlsError = 0;
+  int tlsFlags = 0;
+  const esp_err_t err = esp_http_client_get_and_clear_last_tls_error(client, &tlsError, &tlsFlags);
+  if (err != ESP_OK || tlsError != 0 || tlsFlags != 0) {
+    const int tlsCode = tlsError < 0 ? -tlsError : tlsError;
+    LOG_ERR("OTA", "%s TLS error: err=%s mbedtls=0x%x flags=0x%x", phase, esp_err_to_name(err), tlsCode, tlsFlags);
+  }
+}
+
+// Type-erased parser feed so the same HTTP fetch works for the catalog and
+// the GitHub release JSON without std::function.
+struct ManifestFeed {
+  void (*feed)(void* parser, const char* data, size_t len) = nullptr;
+  void (*reset)(void* parser) = nullptr;
+  void* parser = nullptr;
+};
+
+esp_err_t manifest_event_handler(esp_http_client_event_t* event) {
   if (event->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
   if (event->data_len <= 0) return ESP_OK;
 
-  auto* parser = static_cast<ReleaseJsonParser*>(event->user_data);
-  if (parser == nullptr) {
+  auto* feed = static_cast<ManifestFeed*>(event->user_data);
+  if (feed == nullptr || feed->feed == nullptr) {
     LOG_ERR("OTA", "HTTP client parser missing");
     return ESP_ERR_INVALID_ARG;
   }
 
   totalBytesReceived += static_cast<size_t>(event->data_len);
   LOG_DBG("OTA", "HTTP chunk: %d bytes (total: %zu)", event->data_len, totalBytesReceived);
-  parser->feed(static_cast<const char*>(event->data), event->data_len);
+  feed->feed(feed->parser, static_cast<const char*>(event->data), static_cast<size_t>(event->data_len));
   return ESP_OK;
+}
+
+OtaUpdater::OtaUpdaterError fetchManifestOnce(const char* url, ManifestFeed& feed, const int bufferSize) {
+  esp_http_client_config_t client_config = {
+      .url = url,
+      // The 5s default cuts off handshakes that stall while lwIP waits for
+      // retransmits under heap pressure; match installUpdate's 15s budget.
+      .timeout_ms = 15000,
+      .event_handler = manifest_event_handler,
+      // Sized per manifest: the GitHub API needs 4096 for its headers, the
+      // Pages catalog fits in 2048. The body streams through the parser in
+      // chunks so RX needn't be larger. TX only carries our GET.
+      .buffer_size = bufferSize,
+      .buffer_size_tx = 1024,
+      .user_data = &feed,
+      .skip_cert_common_name_check = true,
+      .crt_bundle_attach = esp_crt_bundle_attach,
+      .keep_alive_enable = true,
+  };
+
+  totalBytesReceived = 0;
+
+  esp_http_client_handle_t client_handle = esp_http_client_init(&client_config);
+  if (!client_handle) {
+    LOG_ERR("OTA", "HTTP Client Handle Failed");
+    return OtaUpdater::INTERNAL_UPDATE_ERROR;
+  }
+
+  esp_err_t esp_err = esp_http_client_set_header(client_handle, "User-Agent", "CrossInk-ESP32-" CROSSINK_VERSION);
+  if (esp_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_http_client_set_header Failed : %s", esp_err_to_name(esp_err));
+    esp_http_client_cleanup(client_handle);
+    return OtaUpdater::INTERNAL_UPDATE_ERROR;
+  }
+
+  // Measured here, not in the failure path: by the time an error is logged
+  // the TLS handle is already freed and the numbers no longer show what the
+  // handshake actually had to work with (#312 diagnostics).
+  LOG_INF("OTA", "Fetching manifest (heap=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  esp_err = esp_http_client_perform(client_handle);
+  if (esp_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_http_client_perform Failed : %s (heap=%u maxAlloc=%u minFree=%u)", esp_err_to_name(esp_err),
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+    logTlsError(client_handle, "Manifest fetch failure");
+    esp_http_client_cleanup(client_handle);
+    return OtaUpdater::HTTP_ERROR;
+  }
+
+  const int statusCode = esp_http_client_get_status_code(client_handle);
+
+  esp_err = esp_http_client_cleanup(client_handle);
+  if (esp_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_http_client_cleanup Failed : %s", esp_err_to_name(esp_err));
+    return OtaUpdater::INTERNAL_UPDATE_ERROR;
+  }
+
+  if (statusCode < 200 || statusCode >= 300) {
+    LOG_ERR("OTA", "Manifest HTTP status: %d", statusCode);
+    return OtaUpdater::HTTP_ERROR;
+  }
+
+  LOG_DBG("OTA", "Response received: %zu bytes total", totalBytesReceived);
+  return OtaUpdater::OK;
+}
+
+// A failed TLS attempt leaves the heap measurably less fragmented once its
+// buffers are freed (field logs in #312 show maxAlloc recovering right after
+// a failure), so one retry often succeeds where the first attempt could not
+// allocate the 16KB TLS record buffer.
+OtaUpdater::OtaUpdaterError fetchManifest(const char* url, ManifestFeed& feed, const int bufferSize) {
+  OtaUpdater::OtaUpdaterError result = fetchManifestOnce(url, feed, bufferSize);
+  if (result == OtaUpdater::OK) return result;
+
+  LOG_INF("OTA", "Retrying manifest fetch");
+  delay(250);
+  if (feed.reset != nullptr) feed.reset(feed.parser);
+  return fetchManifestOnce(url, feed, bufferSize);
 }
 
 void notifyOtaProgress(OtaInstallContext* ctx, const bool force) {
@@ -297,15 +404,6 @@ void notifyOtaProgress(OtaInstallContext* ctx, const bool force) {
   }
 }
 
-void logTlsError(esp_http_client_handle_t client, const char* phase) {
-  int tlsError = 0;
-  int tlsFlags = 0;
-  const esp_err_t err = esp_http_client_get_and_clear_last_tls_error(client, &tlsError, &tlsFlags);
-  if (err != ESP_OK || tlsError != 0 || tlsFlags != 0) {
-    const int tlsCode = tlsError < 0 ? -tlsError : tlsError;
-    LOG_ERR("OTA", "%s TLS error: err=%s mbedtls=0x%x flags=0x%x", phase, esp_err_to_name(err), tlsCode, tlsFlags);
-  }
-}
 }  // namespace
 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
@@ -319,53 +417,43 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   processedSize = 0;
   totalSize = 0;
 
-  esp_err_t esp_err;
+  LOG_DBG("OTA", "Checking for update (current: %s, heap=%u maxAlloc=%u)", CROSSINK_VERSION, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
+
+  // Catalog first: tiny response, cheap to parse. Fall back to the GitHub
+  // releases API so OTA keeps working if Pages/catalog is unavailable.
+  {
+    CatalogJsonParser catalogParser(firmwareVariant);
+    ManifestFeed feed{
+        [](void* parser, const char* data, size_t len) { static_cast<CatalogJsonParser*>(parser)->feed(data, len); },
+        [](void* parser) { static_cast<CatalogJsonParser*>(parser)->reset(); }, &catalogParser};
+    const OtaUpdaterError catalogResult = fetchManifest(catalogUrl, feed, 2048);
+    if (catalogResult == OK && catalogParser.foundRelease()) {
+      latestVersion = catalogParser.getVersion();
+      otaUrl = catalogParser.getFirmwareUrl();
+      otaSha256 = catalogParser.getFirmwareSha256();
+      otaSize = catalogParser.getFirmwareSize();
+      totalSize = otaSize;
+      updateAvailable = true;
+
+      LOG_DBG("OTA", "Catalog update: version=%s size=%zu sha256=%s", latestVersion.c_str(), otaSize,
+              otaSha256.empty() ? "missing" : "present");
+      LOG_DBG("OTA", "Firmware URL: %s", otaUrl.c_str());
+      return OK;
+    }
+    LOG_ERR("OTA", "Catalog check failed (result=%d found=%d), falling back to GitHub API", catalogResult,
+            catalogParser.foundRelease() ? 1 : 0);
+  }
+
   ReleaseJsonParser releaseParser(isMatchingFirmwareAssetName);
-
-  esp_http_client_config_t client_config = {
-      .url = latestReleaseUrl,
-      .event_handler = release_manifest_event_handler,
-      // 4096 holds the API response headers; the 32KB body streams through the
-      // parser in chunks so RX needn't be larger. TX only carries our GET.
-      // Both free before installUpdate, so smaller leaves it less fragmentation.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
-      .user_data = &releaseParser,
-      .skip_cert_common_name_check = true,
-      .crt_bundle_attach = esp_crt_bundle_attach,
-      .keep_alive_enable = true,
-  };
-
-  totalBytesReceived = 0;
-  LOG_DBG("OTA", "Checking for update (current: %s)", CROSSINK_VERSION);
-
-  esp_http_client_handle_t client_handle = esp_http_client_init(&client_config);
-  if (!client_handle) {
-    LOG_ERR("OTA", "HTTP Client Handle Failed");
-    return INTERNAL_UPDATE_ERROR;
+  ManifestFeed feed{
+      [](void* parser, const char* data, size_t len) { static_cast<ReleaseJsonParser*>(parser)->feed(data, len); },
+      [](void* parser) { static_cast<ReleaseJsonParser*>(parser)->reset(); }, &releaseParser};
+  const OtaUpdaterError releaseResult = fetchManifest(latestReleaseUrl, feed, 4096);
+  if (releaseResult != OK) {
+    return releaseResult;
   }
 
-  esp_err = esp_http_client_set_header(client_handle, "User-Agent", "CrossInk-ESP32-" CROSSINK_VERSION);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_set_header Failed : %s", esp_err_to_name(esp_err));
-    esp_http_client_cleanup(client_handle);
-    return INTERNAL_UPDATE_ERROR;
-  }
-
-  esp_err = esp_http_client_perform(client_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_perform Failed : %s", esp_err_to_name(esp_err));
-    esp_http_client_cleanup(client_handle);
-    return HTTP_ERROR;
-  }
-
-  esp_err = esp_http_client_cleanup(client_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_cleanup Failed : %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
-  }
-
-  LOG_DBG("OTA", "Response received: %zu bytes total", totalBytesReceived);
   LOG_DBG("OTA", "Parser results: tag=%s firmware=%s", releaseParser.foundTag() ? "yes" : "no",
           releaseParser.foundFirmware() ? "yes" : "no");
 
@@ -381,7 +469,11 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
     return NO_UPDATE;
   }
 
-  otaUrl = releaseParser.getFirmwareUrl();
+  // Prefer the api.github.com asset endpoint: with Accept:octet-stream it
+  // redirects straight to the CDN, skipping github.com's web tier whose ~5KB
+  // response headers exhaust low-heap devices mid-parse (#312).
+  otaUrl =
+      releaseParser.getFirmwareApiUrl()[0] != '\0' ? releaseParser.getFirmwareApiUrl() : releaseParser.getFirmwareUrl();
   otaSha256 = releaseParser.getFirmwareSha256();
   otaSize = releaseParser.getFirmwareSize();
   totalSize = otaSize;
@@ -449,13 +541,6 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   LOG_INF("OTA", "Starting firmware download: url=%s heap=%u maxAlloc=%u", otaUrl.c_str(), ESP.getFreeHeap(),
           ESP.getMaxAllocHeap());
 
-  auto buffer = makeUniqueNoThrow<char[]>(OTA_READ_BUFFER_SIZE);
-  if (!buffer) {
-    LOG_ERR("OTA", "Failed to allocate %zu byte OTA read buffer (heap=%u maxAlloc=%u)", OTA_READ_BUFFER_SIZE,
-            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    return OOM_ERROR;
-  }
-
   std::string currentUrl = otaUrl;
   esp_http_client_handle_t client = nullptr;
   int64_t contentLength = -1;
@@ -467,13 +552,24 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     esp_http_client_config_t client_config = {};
     client_config.url = currentUrl.c_str();
     client_config.timeout_ms = 15000;
-    // 4096 holds the github->CDN redirect headers (the 512 default truncates
-    // them); TX only carries our GET. Both are contiguous blocks contending
-    // with the TLS handshake on a tight internal arena, so keep them minimal.
-    client_config.buffer_size = 4096;
+    // Hop 0 hits github.com whose 302 carries ~5KB of headers (a 3.6KB CSP
+    // alone), so it needs the 4KB header buffer. The post-redirect CDN sends
+    // <1KB of headers; every KB freed here raises the heap floor under the
+    // TLS handshake (#312).
+    client_config.buffer_size = hop == 0 ? 4096 : 1536;
     client_config.buffer_size_tx = 1024;
     client_config.skip_cert_common_name_check = true;
-    client_config.crt_bundle_attach = esp_crt_bundle_attach;
+    // Signed-artifact model, like apt: hop 0 talks to the manifest authority
+    // and is always chain-verified; it supplied the firmware sha256 that
+    // installUpdate enforces below, so the CDN hops the authority redirects
+    // to add no integrity and skip chain verification when that sha256 is
+    // present. A tampered download fails HASH_MISMATCH_ERROR and is never
+    // booted. This matters on the ESP32-C3: the CDN's Let's Encrypt chain
+    // needs software RSA-4096 verifies whose handshake peak (~65KB) exceeds
+    // any heap this firmware can free up (#312).
+    if (hop == 0 || !isSha256Hex(otaSha256.c_str())) {
+      client_config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
     client_config.event_handler = captureLocationHeader;
     client_config.user_data = &redirectLocation;
     client_config.keep_alive_enable = false;
@@ -492,19 +588,31 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       return INTERNAL_UPDATE_ERROR;
     }
 
+    // Makes the api.github.com asset endpoint 302 to the CDN instead of
+    // returning JSON; ignored by the other hosts on the redirect chain.
+    esp_err = esp_http_client_set_header(client, "Accept", "application/octet-stream");
+    if (esp_err != ESP_OK) {
+      LOG_ERR("OTA", "Failed to set OTA Accept header: %s", esp_err_to_name(esp_err));
+      esp_http_client_cleanup(client);
+      return INTERNAL_UPDATE_ERROR;
+    }
+
     LOG_INF("OTA", "Opening firmware connection");
     esp_err = esp_http_client_open(client, 0);
     if (esp_err != ESP_OK) {
-      LOG_ERR("OTA", "Firmware HTTP open failed: %s (heap=%u maxAlloc=%u)", esp_err_to_name(esp_err), ESP.getFreeHeap(),
-              ESP.getMaxAllocHeap());
+      LOG_ERR("OTA", "Firmware HTTP open failed: %s (heap=%u maxAlloc=%u minFree=%u)", esp_err_to_name(esp_err),
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
       logTlsError(client, "Firmware open failure");
       esp_http_client_cleanup(client);
       return HTTP_ERROR;
     }
 
-    LOG_INF("OTA", "Fetching firmware headers");
+    LOG_INF("OTA", "Fetching firmware headers (heap=%u maxAlloc=%u minFree=%u)", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     contentLength = esp_http_client_fetch_headers(client);
     statusCode = esp_http_client_get_status_code(client);
+    LOG_INF("OTA", "Firmware headers done: status=%d len=%lld (heap=%u maxAlloc=%u minFree=%u)", statusCode,
+            static_cast<long long>(contentLength), ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     if (contentLength < 0) {
       LOG_ERR("OTA", "Firmware header fetch failed: %lld", static_cast<long long>(contentLength));
       logTlsError(client, "Firmware header failure");
@@ -579,6 +687,17 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     esp_ota_abort(otaHandle);
     esp_http_client_cleanup(client);
     return INTERNAL_UPDATE_ERROR;
+  }
+
+  // Allocated only now: during the redirect/TLS phase above every free KB
+  // counts, and the buffer is first needed for the read loop below.
+  auto buffer = makeUniqueNoThrow<char[]>(OTA_READ_BUFFER_SIZE);
+  if (!buffer) {
+    LOG_ERR("OTA", "Failed to allocate %zu byte OTA read buffer (heap=%u maxAlloc=%u)", OTA_READ_BUFFER_SIZE,
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    esp_ota_abort(otaHandle);
+    esp_http_client_cleanup(client);
+    return OOM_ERROR;
   }
 
   mbedtls_sha256_context shaCtx;

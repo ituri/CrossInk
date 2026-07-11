@@ -33,6 +33,21 @@ class OtaUpdater {
 
   size_t getTotalSize() const { return totalSize; }
 
+  const std::string& getOtaUrl() const { return otaUrl; }
+
+  const std::string& getOtaSha256() const { return otaSha256; }
+
+  // Restores a manifest captured by an earlier checkForUpdate() — used to hand
+  // the result of a boot-time check across the reboot into installUpdate().
+  void adoptManifest(const std::string& version, const std::string& url, const std::string& sha256, const size_t size) {
+    latestVersion = version;
+    otaUrl = url;
+    otaSha256 = sha256;
+    otaSize = size;
+    totalSize = size;
+    updateAvailable = true;
+  }
+
   OtaUpdater() = default;
   bool isUpdateNewer() const;
   const std::string& getLatestVersion() const;

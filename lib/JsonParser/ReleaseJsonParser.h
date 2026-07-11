@@ -22,6 +22,11 @@ class ReleaseJsonParser {
   bool foundFirmware() const;
   const char* getTagName() const;
   const char* getFirmwareUrl() const;
+  // The api.github.com asset endpoint ("url" field). With
+  // "Accept: application/octet-stream" it 302s straight to the CDN, skipping
+  // the github.com web tier whose ~5KB response headers crash low-heap
+  // devices (#312). Empty when the release JSON carried none.
+  const char* getFirmwareApiUrl() const;
   size_t getFirmwareSize() const;
   const char* getFirmwareSha256() const;
 
@@ -38,6 +43,7 @@ class ReleaseJsonParser {
     ASSETS,
     ASSET_NAME,
     ASSET_URL,
+    ASSET_API_URL,
     ASSET_SIZE,
     ASSET_SHA256,
     ASSET_DIGEST,
@@ -65,6 +71,7 @@ class ReleaseJsonParser {
 
   char tagName[32];
   char firmwareUrl[512];
+  char firmwareApiUrl[128];
   char firmwareSha256[65];
   size_t firmwareSize;
   bool tagFound;
@@ -72,6 +79,7 @@ class ReleaseJsonParser {
 
   char currentAssetName[96];
   char currentAssetUrl[512];
+  char currentAssetApiUrl[128];
   char currentAssetSha256[65];
   size_t currentAssetSize;
 };
